@@ -15,13 +15,14 @@ from dotenv import load_dotenv
 load_dotenv()
 from typing import Any
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from .browser import get_browser_manager, get_browser_info, startup_browser, shutdown_browser
 from .runner import execute_test
+from .recorder import start_recording, stop_recording, get_session, list_sessions
 from .logging import setup_logging, get_logger, request_id_var
 
 # Initialize logging
@@ -89,10 +90,17 @@ class TestStep(BaseModel):
     description: str | None = None
 
 
+class ViewportSize(BaseModel):
+    """Browser viewport dimensions."""
+    width: int = 1280
+    height: int = 720
+
+
 class TestOptions(BaseModel):
     """Test execution options."""
 
     browser: str | None = None  # Browser ID (e.g., "chrome", "chromium-headless")
+    viewport: ViewportSize | None = None  # Browser viewport size
     timeout: int = 30000
     screenshot_on_failure: bool = True
 
@@ -127,6 +135,29 @@ class BrowsersResponse(BaseModel):
 
     browsers: list[BrowserInfo]
     default: str
+
+
+class ConfigUpdate(BaseModel):
+    """Update executor runtime configuration."""
+    preload: bool
+
+
+@app.get("/config")
+async def get_executor_config() -> dict:
+    """Get executor configuration (preload flag + per-browser running status)."""
+    return get_browser_manager().get_config()
+
+
+@app.post("/config")
+async def update_executor_config(update: ConfigUpdate) -> dict:
+    """Update executor configuration at runtime.
+
+    Setting preload=true immediately starts any browsers not yet running.
+    Setting preload=false only updates the flag; running browsers stay open.
+    To make permanent, set BROWSER_PRELOAD=false in your .env file.
+    """
+    await get_browser_manager().set_preload(update.preload)
+    return get_browser_manager().get_config()
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -269,6 +300,211 @@ async def execute_sync_endpoint(request: ExecuteRequest) -> JSONResponse:
         "result": result,
         "events": events,
     })
+
+
+# ── Scan elements endpoint (used by the healer) ───────────────────────────────
+
+
+class ScanElementsRequest(BaseModel):
+    """Request to scan interactive elements on a page."""
+    url: str
+    timeout: int = 15000  # ms to wait for page load
+
+
+class ScanElementsResponse(BaseModel):
+    """Interactive elements visible on the scanned page."""
+    url: str
+    elements: list[str]   # visible text of each interactive element, deduped
+
+
+@app.post("/scan-elements", response_model=ScanElementsResponse)
+async def scan_elements(request: ScanElementsRequest) -> ScanElementsResponse:
+    """Navigate headlessly to a URL and return all visible interactive element texts.
+
+    Used by the Auto-Heal pipeline so the LLM knows what elements actually exist
+    on the page — enabling it to match stale/misspelled selectors to real ones.
+    """
+    from playwright.async_api import async_playwright
+
+    elements: list[str] = []
+
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            context = await browser.new_context(
+                viewport={"width": 1280, "height": 720},
+                user_agent=(
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36"
+                ),
+            )
+            page = await context.new_page()
+
+            try:
+                await page.goto(request.url, wait_until="domcontentloaded", timeout=request.timeout)
+                # Brief wait for dynamic menus / hydration
+                await page.wait_for_timeout(800)
+
+                # Extract visible text from every interactive element
+                raw: list[str] = await page.evaluate("""() => {
+                    const selectors = [
+                        'a', 'button', '[role="button"]', '[role="menuitem"]',
+                        '[role="link"]', '[role="tab"]', 'nav *',
+                        'h1', 'h2', 'h3',
+                        'input[type="submit"]', 'input[type="button"]',
+                        '[aria-label]',
+                    ];
+                    const seen = new Set();
+                    const results = [];
+                    selectors.forEach(sel => {
+                        document.querySelectorAll(sel).forEach(el => {
+                            // Prefer aria-label, then visible text
+                            const label = el.getAttribute('aria-label') || el.innerText || el.textContent || '';
+                            const text = label.trim().replace(/\\s+/g, ' ');
+                            if (text && text.length <= 80 && !seen.has(text)) {
+                                // Skip if element is hidden
+                                const style = window.getComputedStyle(el);
+                                if (style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0') {
+                                    seen.add(text);
+                                    results.push(text);
+                                }
+                            }
+                        });
+                    });
+                    return results;
+                }""")
+
+                elements = raw[:120]  # cap to avoid token overload
+                logger.info(f"scan-elements: found {len(elements)} elements at {request.url}")
+            finally:
+                await context.close()
+                await browser.close()
+    except Exception as exc:
+        logger.warning(f"scan-elements failed for {request.url}: {exc}")
+        # Return empty list — healer gracefully falls back to screenshot-only mode
+
+    return ScanElementsResponse(url=request.url, elements=elements)
+
+
+# ── Recorder endpoints ────────────────────────────────────────────────────────
+
+
+class RecordStartRequest(BaseModel):
+    """Start a recording session."""
+    base_url: str
+    viewport: ViewportSize | None = None
+
+
+class RecordStartResponse(BaseModel):
+    session_id: str
+    ws_url: str
+
+
+@app.post("/recorder/start", response_model=RecordStartResponse)
+async def recorder_start(request: Request, body: RecordStartRequest) -> RecordStartResponse:
+    """Start a new recording session with a headed browser."""
+    vp = body.viewport.model_dump() if body.viewport else None
+    session = await start_recording(base_url=body.base_url, viewport=vp)
+    host = request.headers.get("host", "localhost:8932")
+    ws_url = f"ws://{host}/recorder/ws/{session.session_id}"
+    return RecordStartResponse(session_id=session.session_id, ws_url=ws_url)
+
+
+@app.post("/recorder/stop")
+async def recorder_stop(body: dict) -> JSONResponse:
+    """Stop a recording session and return captured events."""
+    session_id = body.get("session_id", "")
+    try:
+        result = await stop_recording(session_id)
+        return JSONResponse(content=result)
+    except ValueError as e:
+        return JSONResponse(status_code=404, content={"detail": str(e)})
+
+
+@app.get("/recorder/status")
+async def recorder_status() -> JSONResponse:
+    """List active recording sessions."""
+    return JSONResponse(content={"sessions": list_sessions()})
+
+
+@app.get("/recorder/events/{session_id}")
+async def recorder_get_events(session_id: str) -> JSONResponse:
+    """Return events captured so far for a session without stopping it."""
+    session = get_session(session_id)
+    if not session:
+        return JSONResponse(status_code=404, content={"detail": "Session not found"})
+    return JSONResponse(content={"events": session.events, "count": len(session.events)})
+
+
+@app.websocket("/recorder/ws/{session_id}")
+async def recorder_websocket(websocket: WebSocket, session_id: str):
+    """Bidirectional WebSocket for a recording session.
+
+    - Outbound: raw DOM events as they are captured
+    - Inbound: control commands (pause, resume, stop)
+    """
+    session = get_session(session_id)
+    if not session:
+        await websocket.close(code=4004, reason="Session not found")
+        return
+
+    await websocket.accept()
+    logger.info(f"[{session_id}] WebSocket connected")
+
+    event_queue: asyncio.Queue[dict | None] = asyncio.Queue()
+
+    # Wire up the session's on_event callback to push into our queue
+    async def forward_event(event: dict):
+        await event_queue.put(event)
+
+    session.on_event = forward_event
+
+    # Send any events that were captured before the WS connected
+    for existing_event in session.events:
+        await websocket.send_json(existing_event)
+
+    async def send_events():
+        """Forward events from queue to WebSocket."""
+        try:
+            while True:
+                event = await event_queue.get()
+                if event is None:
+                    break
+                await websocket.send_json(event)
+        except Exception:
+            pass
+
+    async def receive_commands():
+        """Listen for control commands from the client."""
+        try:
+            while True:
+                data = await websocket.receive_json()
+                cmd = data.get("command")
+                if cmd == "stop":
+                    await stop_recording(session_id)
+                    await event_queue.put(None)
+                    break
+        except WebSocketDisconnect:
+            logger.info(f"[{session_id}] WebSocket disconnected")
+        except Exception as e:
+            logger.warning(f"[{session_id}] WebSocket receive error: {e}")
+
+    sender = asyncio.create_task(send_events())
+    receiver = asyncio.create_task(receive_commands())
+
+    try:
+        done, pending = await asyncio.wait(
+            [sender, receiver], return_when=asyncio.FIRST_COMPLETED
+        )
+        for task in pending:
+            task.cancel()
+    finally:
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+        logger.info(f"[{session_id}] WebSocket closed")
 
 
 if __name__ == "__main__":
