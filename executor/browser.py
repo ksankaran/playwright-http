@@ -164,7 +164,7 @@ def parse_available_browsers() -> list[str]:
         - firefox, firefox-headless
         - webkit, webkit-headless
     """
-    env_value = os.getenv("AVAILABLE_BROWSERS", "chromium,chromium-headless")
+    env_value = os.getenv("AVAILABLE_BROWSERS", "chromium,chromium-headless,firefox,firefox-headless,webkit,webkit-headless")
     browsers = [b.strip().lower() for b in env_value.split(",") if b.strip()]
 
     # Validate browser identifiers
