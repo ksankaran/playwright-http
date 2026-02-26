@@ -4,7 +4,10 @@ Manages multiple browser instances that are reused across requests.
 Each test gets a fresh browser context for isolation.
 """
 
+import asyncio
 import os
+import subprocess
+import sys
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
@@ -132,15 +135,17 @@ def get_stealth_script(is_linux: bool = False) -> str:
 
 
 # Browser display names for UI
+# "chromium" = Playwright's bundled Chromium build (not system Chrome)
+# "chrome"   = system Google Chrome installed on the machine (channel="chrome")
 BROWSER_DISPLAY_NAMES = {
-    "chromium": "Chromium",
-    "chromium-headless": "Chromium (Headless)",
-    "chrome": "Google Chrome",
-    "chrome-headless": "Google Chrome (Headless)",
+    "chromium": "Google Chrome",
+    "chromium-headless": "Google Chrome (Headless)",
+    "chrome": "Chrome",
+    "chrome-headless": "Chrome (Headless)",
     "firefox": "Firefox",
     "firefox-headless": "Firefox (Headless)",
-    "webkit": "WebKit",
-    "webkit-headless": "WebKit (Headless)",
+    "webkit": "Safari",
+    "webkit-headless": "Safari (Headless)",
 }
 
 
@@ -159,7 +164,7 @@ def parse_available_browsers() -> list[str]:
         - firefox, firefox-headless
         - webkit, webkit-headless
     """
-    env_value = os.getenv("AVAILABLE_BROWSERS", "chromium-headless")
+    env_value = os.getenv("AVAILABLE_BROWSERS", "chromium,chromium-headless")
     browsers = [b.strip().lower() for b in env_value.split(",") if b.strip()]
 
     # Validate browser identifiers
@@ -186,6 +191,33 @@ def get_browser_info(browser_id: str) -> dict:
     }
 
 
+def _macos_activate_browser(base_type: str) -> None:
+    """Best-effort macOS window activation via osascript.
+
+    On macOS, focus stealing is restricted by default. osascript can bypass
+    this restriction for apps with the correct bundle ID. This is a no-op
+    on non-macOS platforms or if the app name is unknown.
+    """
+    # Map browser base type to the macOS app name osascript uses
+    app_names: dict[str, str] = {
+        "firefox": "Firefox",
+        "chrome": "Google Chrome",
+        "chromium": "Chromium",
+        # WebKit: Playwright bundles its own WebKit binary — no standard app name
+    }
+    app_name = app_names.get(base_type)
+    if not app_name:
+        return
+    try:
+        subprocess.run(
+            ["osascript", "-e", f'tell application "{app_name}" to activate'],
+            timeout=2,
+            capture_output=True,
+        )
+    except Exception:
+        pass  # Best-effort only — never block test execution
+
+
 class BrowserManager:
     """Manages multiple browser instances.
 
@@ -199,6 +231,7 @@ class BrowserManager:
         self._available_browsers: list[str] = []
         self._timeout: int = 30000
         self._default_browser: str = "chromium-headless"
+        self._preload: bool = True
 
     async def start(self, timeout: int = 30000) -> None:
         """Start available browsers.
@@ -210,14 +243,16 @@ class BrowserManager:
         self._available_browsers = parse_available_browsers()
         self._default_browser = self._available_browsers[0] if self._available_browsers else "chromium-headless"
 
-        logger.info(f"Starting browsers: {self._available_browsers}")
+        self._preload = os.getenv("BROWSER_PRELOAD", "true").lower() not in ("false", "0", "no")
         self._playwright = await async_playwright().start()
 
-        # Start each configured browser
-        for browser_id in self._available_browsers:
-            await self._start_browser(browser_id)
-
-        logger.info(f"All browsers started. Default: {self._default_browser}")
+        if self._preload:
+            logger.info(f"Starting browsers (eager): {self._available_browsers}")
+            for browser_id in self._available_browsers:
+                await self._start_browser(browser_id)
+            logger.info(f"All browsers started. Default: {self._default_browser}")
+        else:
+            logger.info(f"Lazy mode: browsers start on first use. Configured: {self._available_browsers}")
 
     async def _start_browser(self, browser_id: str) -> None:
         """Start a specific browser instance."""
@@ -262,7 +297,10 @@ class BrowserManager:
                     args=chromium_args,
                 )
             elif base_type == "firefox":
-                launch_opts = {"headless": headless}
+                launch_opts: dict = {"headless": headless}
+                if not headless:
+                    # Force window to foreground on macOS; harmless on other platforms
+                    launch_opts["args"] = ["-foreground"]
                 if firefox_path:
                     launch_opts["executable_path"] = firefox_path
                 browser = await self._playwright.firefox.launch(**launch_opts)
@@ -286,6 +324,15 @@ class BrowserManager:
             # Remove from available list if failed to start
             if browser_id in self._available_browsers:
                 self._available_browsers.remove(browser_id)
+
+    async def _ensure_browser(self, browser_id: str) -> None:
+        """Start a browser on demand if not already running (lazy mode)."""
+        if browser_id not in self._browsers:
+            if browser_id not in self._available_browsers:
+                raise RuntimeError(
+                    f"Browser '{browser_id}' not available. Available: {', '.join(self._available_browsers)}"
+                )
+            await self._start_browser(browser_id)
 
     async def stop(self) -> None:
         """Stop all browsers and cleanup resources."""
@@ -330,6 +377,28 @@ class BrowserManager:
         """Check if at least one browser is running."""
         return any(b.is_connected() for b in self._browsers.values())
 
+    def get_config(self) -> dict:
+        """Return current preload setting and per-browser running status."""
+        return {
+            "preload": self._preload,
+            "browsers": [
+                {**get_browser_info(bid), "running": bid in self._browsers}
+                for bid in self._available_browsers
+            ],
+        }
+
+    async def set_preload(self, value: bool) -> None:
+        """Enable or disable browser pre-warming.
+
+        When enabling, immediately starts any browsers not yet running.
+        When disabling, running browsers are left open (non-disruptive).
+        """
+        self._preload = value
+        if value:
+            for browser_id in self._available_browsers:
+                if browser_id not in self._browsers:
+                    await self._start_browser(browser_id)
+
     @asynccontextmanager
     async def new_context(
         self,
@@ -351,6 +420,8 @@ class BrowserManager:
         """
         if browser_id is None:
             browser_id = self._default_browser
+
+        await self._ensure_browser(browser_id)
 
         browser = self.get_browser(browser_id)
         if not browser:
@@ -423,6 +494,17 @@ class BrowserManager:
             browser_id=browser_id, viewport=viewport, user_agent=user_agent
         ) as context:
             page = await context.new_page()
+            # For headed mode, activate the window so it's visible on screen
+            effective_browser = browser_id or self._default_browser
+            if not effective_browser.endswith("-headless"):
+                await page.bring_to_front()
+                # Give macOS time to process the window activation event
+                await asyncio.sleep(0.3)
+                # On macOS, use osascript to force the browser app to the foreground
+                # since Playwright's bring_to_front() only works at the tab level
+                if sys.platform == "darwin":
+                    base_type = effective_browser.replace("-headless", "")
+                    _macos_activate_browser(base_type)
             try:
                 yield page
             finally:

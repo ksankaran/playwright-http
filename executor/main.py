@@ -103,6 +103,7 @@ class TestOptions(BaseModel):
     viewport: ViewportSize | None = None  # Browser viewport size
     timeout: int = 30000
     screenshot_on_failure: bool = True
+    viewport: ViewportSize | None = None  # Browser viewport size
 
 
 class ExecuteRequest(BaseModel):
